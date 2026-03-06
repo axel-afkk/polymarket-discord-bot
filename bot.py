@@ -27,10 +27,10 @@ TRACK_15M = os.environ.get("TRACK_15M", "true").lower() == "true"
 TRACK_HOURLY = os.environ.get("TRACK_HOURLY", "true").lower() == "true"
 
 # Discord send controls
-DISCORD_SEND_DELAY_SECONDS = float(os.environ.get("DISCORD_SEND_DELAY_SECONDS", "1.2"))
-DISCORD_BATCH_WINDOW_SECONDS = float(os.environ.get("DISCORD_BATCH_WINDOW_SECONDS", "2.0"))
-DISCORD_MAX_ALERTS_PER_MESSAGE = int(os.environ.get("DISCORD_MAX_ALERTS_PER_MESSAGE", "5"))
-STARTUP_GRACE_SECONDS = int(os.environ.get("STARTUP_GRACE_SECONDS", "15"))
+DISCORD_SEND_DELAY_SECONDS = float(os.environ.get("DISCORD_SEND_DELAY_SECONDS", "2.5"))
+DISCORD_BATCH_WINDOW_SECONDS = float(os.environ.get("DISCORD_BATCH_WINDOW_SECONDS", "3.0"))
+DISCORD_MAX_ALERTS_PER_MESSAGE = int(os.environ.get("DISCORD_MAX_ALERTS_PER_MESSAGE", "10"))
+STARTUP_GRACE_SECONDS = int(os.environ.get("STARTUP_GRACE_SECONDS", "60"))
 
 LEADERBOARD_URL = "https://data-api.polymarket.com/v1/leaderboard"
 TRADES_URL = "https://data-api.polymarket.com/trades"
@@ -252,6 +252,53 @@ async def enqueue_alert(wallet: str, trade: dict):
     await alert_queue.put(format_alert(wallet, trade))
 
 
+def chunk_message_blocks(blocks: List[str], max_len: int = 1900) -> List[str]:
+    chunks = []
+    current = ""
+
+    for block in blocks:
+        candidate = block if not current else f"{current}\n\n{block}"
+        if len(candidate) <= max_len:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            if len(block) <= max_len:
+                current = block
+            else:
+                # very defensive: split oversized single block
+                for i in range(0, len(block), max_len):
+                    chunks.append(block[i:i + max_len])
+                current = ""
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+async def safe_send_with_retry(channel: discord.abc.Messageable, content: str):
+    try:
+        await channel.send(content)
+
+    except discord.HTTPException as e:
+        if getattr(e, "status", None) == 429:
+            retry = getattr(e, "retry_after", 10)
+            wait_time = float(retry) + 1.0
+            print(f"[discord] Rate limited. Sleeping {wait_time:.2f}s")
+            await asyncio.sleep(wait_time)
+
+            try:
+                await channel.send(content)
+            except Exception as e2:
+                print("[discord] Retry failed:", repr(e2))
+        else:
+            print("[discord] send error:", repr(e))
+
+    except Exception as e:
+        print("[discord] unexpected send error:", repr(e))
+
+
 async def discord_sender_loop(channel: discord.abc.Messageable):
     """
     One sender only.
@@ -263,36 +310,23 @@ async def discord_sender_loop(channel: discord.abc.Messageable):
         batch = [first]
 
         deadline = asyncio.get_running_loop().time() + DISCORD_BATCH_WINDOW_SECONDS
+
         while len(batch) < DISCORD_MAX_ALERTS_PER_MESSAGE:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 break
+
             try:
                 item = await asyncio.wait_for(alert_queue.get(), timeout=remaining)
                 batch.append(item)
             except asyncio.TimeoutError:
                 break
 
-        message = "\n\n".join(batch)
+        messages = chunk_message_blocks(batch, max_len=1900)
 
-        try:
-            await channel.send(message[:1900])
-        except discord.HTTPException as e:
-            if getattr(e, "status", None) == 429:
-                retry_after = getattr(e, "retry_after", None)
-                wait_time = float(retry_after) if retry_after is not None else 10.0
-                print(f"[discord] 429 hit, sleeping {wait_time:.2f}s")
-                await asyncio.sleep(wait_time)
-                try:
-                    await channel.send(message[:1900])
-                except Exception as e2:
-                    print("[discord] retry failed:", repr(e2))
-            else:
-                print("[discord] send error:", repr(e))
-        except Exception as e:
-            print("[discord] unexpected send error:", repr(e))
-
-        await asyncio.sleep(DISCORD_SEND_DELAY_SECONDS)
+        for msg in messages:
+            await safe_send_with_retry(channel, msg)
+            await asyncio.sleep(DISCORD_SEND_DELAY_SECONDS)
 
 
 async def refresh_leaderboard_loop(session: aiohttp.ClientSession):
@@ -392,10 +426,8 @@ async def trade_loop(channel: discord.abc.Messageable):
                         if dt:
                             age = (datetime.now(timezone.utc) - dt).total_seconds()
                             if age > 180:
-                                # skip stale trades older than 3 minutes
                                 continue
 
-                            # startup grace: avoid a burst right after boot
                             uptime = (datetime.now(timezone.utc) - startup_time).total_seconds()
                             if uptime < STARTUP_GRACE_SECONDS:
                                 continue
